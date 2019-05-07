@@ -31,6 +31,8 @@ import (
 
 // Global variables needed to maintain the session (and to feature an one time initialization).
 var ctx context.Context
+var cancel context.CancelFunc
+
 var client* speech.Client
 var stream speechpb.Speech_StreamingRecognizeClient
 
@@ -63,16 +65,27 @@ var initialized = false
 
 // Next comment is needed by cgo to know which function to export.
 //export InitializeStream
-func InitializeStream(cTranscriptLanguage *_Ctype_char, cSampleRate C.int) (C.int) {
+func InitializeStream(cTranscriptLanguage *_Ctype_char, cSampleRate C.int, cTranscriptionModel *_Ctype_char, cMaxAlternatives C.int, cInterimResults C.int ) (C.int) {
 	
-	// converts the input C integer to a go integger (needed to send the initialization message)
-	goSampleRate := int32(cSampleRate)
 
 	// converts the input C string to a go string (needed to send the initialization message)
 	goTranscriptLanguage := C.GoString(cTranscriptLanguage)
 
+	// converts the input C integer to a go integer (needed to send the initialization message)
+	goSampleRate := int32(cSampleRate)
+
+	// converts the input C string to a go string (needed to send the initialization message)
+	goTranscriptionModel := C.GoString(cTranscriptionModel)
+
+	// converts the input C integer to a go integer (needed to send the initialization message)
+	goMaxAlternatives := int32(cMaxAlternatives)
+
+	// "converts" the input C integer to a bool
+	goInterimResults := int32(cInterimResults) == int32(1)
+
+
 	// Set the context for the stream.
-	ctx = context.Background()
+	ctx, cancel = context.WithCancel(context.Background())
 
 	// Create a new Client.
 	client, err := speech.NewClient(ctx)
@@ -93,10 +106,13 @@ func InitializeStream(cTranscriptLanguage *_Ctype_char, cSampleRate C.int) (C.in
 				StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
 					StreamingConfig: &speechpb.StreamingRecognitionConfig{
 						Config: &speechpb.RecognitionConfig{
-							Encoding:        speechpb.RecognitionConfig_LINEAR16,
-							SampleRateHertz: goSampleRate,						// Remember to use a recording with 16KHz sample rate.
-							LanguageCode:    goTranscriptLanguage,		// Can be adjusted to language to be transcribed.
+							Encoding:			speechpb.RecognitionConfig_LINEAR16,
+							SampleRateHertz:	goSampleRate,				// Remember to use a recording with 16KHz sample rate.
+							LanguageCode:		goTranscriptLanguage,		// Can be adjusted to language to be transcribed. (BCP-47)
+							Model:				goTranscriptionModel,		// Can be either "video", "phone_call", "command_and_search", "default" (see https://cloud.google.com/speech-to-text/docs/basics)
+							MaxAlternatives:	goMaxAlternatives,			// Maximum number of recognition hypotheses: Valid values are 0-30, 0 or 1 return only one							
 							},
+						InterimResults:	goInterimResults,	// boolean
 						},
 					},
 				}); 
@@ -165,84 +181,132 @@ func SendAudio(recording *C.short, recordingLength C.int) (C.int){
 		// n is needed to keep track of the reading progress
 		n, err := temporaryByteBuffer.Read(pipeline)		
 		
+		// Stop streaming when reaching the end of the input stream.
+		if err == io.EOF {
+			return C.int(1)
+		}
+
 		if n > 0 {
 			
 			// Ensure that the stream is initialized
 			sendMutex.Lock()			
-			// Check if the stream is initialized
-			if initialized == false {
-				logStatus = ("Stream is not initialized")
-				return C.int(1)
-			}	
-			// Send the pipeline upto the n-th byte (except the last loop run n==1024) as a message to google
-			err := stream.Send(&speechpb.StreamingRecognizeRequest{
-					StreamingRequest: &speechpb.StreamingRecognizeRequest_AudioContent{
-						AudioContent: pipeline[:n],		
-						},
-					});
+				// Check if the stream is initialized
+				if initialized == false {
+
+					sendMutex.Unlock()
+
+					logStatus = ("Stream is not initialized")
+					return C.int(1)
+				}	
+				// Send the pipeline upto the n-th byte (except the last loop run n==1024) as a message to google
+				err := stream.Send(&speechpb.StreamingRecognizeRequest{
+						StreamingRequest: &speechpb.StreamingRecognizeRequest_AudioContent{
+							AudioContent: pipeline[:n],		
+							},
+						});
+
 			sendMutex.Unlock()
+			
+			if err == context.Canceled {
+				return C.int(1)
+			}
 			if err != nil {
 				logStatus = ("Could not send audio:" + err.Error())
 				return C.int(0)
 			}
 		}
-		// Stop streaming when reaching the end of the input stream.
-		if err == io.EOF {
-			logStatus = err.Error()
-			return C.int(1)
-		}	
 	}
-
 }
 
 
 /*
-	ReceiveTranscript ()  (*_Ctype_char):	
-	retrieves and returns the current final transcripts from Google
-	Return: 
-		*_Ctype_char
-		(can be received as a string in C++)
+	ReceiveTranscript (output **C.char) (C.int):	
+	retrieves and saves the current final transcripts from Google
+	
+	After the call output contains the current final transcript 
+	
+	Parameters:
+		output:
+			The pointer which is used to store the current final transcript
+				
+	Return:
+		1 if successful
+		0 if failed (error log can be retrieved with "GetLog()")
 */
 
 // Next comment is needed by cgo to know which function to export.
 //export ReceiveTranscript
-func ReceiveTranscript ()  (*_Ctype_char) {
+func ReceiveTranscript (output **C.char) (C.int) {
 
 	// Ensure that the stream is initialized
 	receiveMutex.Lock()
 		// Check if the stream is initialized
 		if initialized == false {
+			receiveMutex.Unlock()
 			logStatus = ("Stream is not initialized")
-			return C.CString("")
+			return C.int(0)
 		}
 		// Check if there are results or errors yet.
 		resp, err := stream.Recv()
 	receiveMutex.Unlock()
 
 	// Error handling.
+	if err == context.Canceled {
+		return C.int(1)
+	}
+
+
 	if err != nil {
 		logStatus = ("Cannot stream results: " + err.Error())
+		return C.int(0)
 	}
 
 	if err := resp.Error; err != nil {
 		logStatus = ("Could not recognize: " + err.GetMessage())
+		return C.int(0)
 	}
 
-	// Check received message for results and return it as a C.CString.
-	for _, transcribed := range resp.Results {	
-		// Needed to get only the transcription without additional informations i.e. "confidence".
-		for _, result := range transcribed.Alternatives { 
-			// If the result string starts with a space - remove it
-			if(len(result.Transcript) > 0 && result.Transcript[0] == " "[0]) {
-				return C.CString(result.Transcript[1:])
-			}
+	var helperString = "";
 
-			return C.CString(result.Transcript)
+	// Check received message for results and store it in helperString.
+	for _, result := range resp.Results {	
+		// Needed to get only the transcription without additional informations i.e. "confidence".
+		for _, alternative := range result.Alternatives { 
+			// If the alternative string starts with a space - remove it
+			if(len(alternative.Transcript) > 0 && alternative.Transcript[0] == " "[0]) {
+				
+				// Concatenate the alternatives, splitted by ';'
+				helperString += alternative.Transcript[1:] + (string(';'))
+
+			} else {
+
+				// Concatenate the alternatives, splitted by ';'
+				helperString += alternative.Transcript + (string(';'))
+			}
 		}		
 	}
+	
+	// Fill output and remove semicolons in front/end
 
-	// Nothing has been transcribed - therefore we return an empty CString.
-	return C.CString("")
+	// ";word;"" -> "word"
+	if((helperString[0] == ";"[0]) && (helperString[len(helperString)-1] == ";"[0])){
+		*output = C.CString(helperString[1:len(helperString)-1])
+		return C.int(1)
+
+	// "word;"" -> "word"
+	}else if ((helperString[0] != ";"[0]) && (helperString[len(helperString)-1] == ";"[0])){
+		*output = C.CString(helperString[:len(helperString)-1])
+		return C.int(1)
+
+	// ";word"" -> "word"
+	}else if ((helperString[0] == ";"[0]) && (helperString[len(helperString)-1] != ";"[0])){
+		*output = C.CString(helperString[1:])
+		return C.int(1)
+	}
+
+	// "word"
+	*output = C.CString(helperString)
+	return C.int(1)
 }
 
 
@@ -269,7 +333,7 @@ func GetLog () (*_Ctype_char) {
 // Next comment is needed by cgo to know which function to export.
 //export CloseStream
 func CloseStream () () {
-	
+	cancel()
 	// Ensure that no sending or receiving is done while closing the stream.
 	sendMutex.Lock()
 	receiveMutex.Lock()
@@ -277,7 +341,7 @@ func CloseStream () () {
 		client = nil
 		ctx = nil
 		initialized = false
-	receiveMutex.Unlock()	
+	receiveMutex.Unlock()
 	sendMutex.Unlock()
 }
 

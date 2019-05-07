@@ -132,9 +132,13 @@ GO_SPEECH_RECOGNITION_BOOL:
 	
 	
 And now you are able to call the functions provided by the library.
-First initialize the stream (provide a [BCP-47](https://www.rfc-editor.org/rfc/bcp/bcp47.txt) language tag to set the language to be transcribed and the Samplerate of the audio recording as an integer value):
+First initialize the stream :
+(provide a [BCP-47](https://www.rfc-editor.org/rfc/bcp/bcp47.txt) language tag to set the language to be transcribed and the Samplerate of the audio recording as an integer value)
+(add which transcription model to use, it can be either "video", "phone_call", "command_and_search" or "default" - see [Documentation](https://cloud.google.com/speech-to-text/docs/basics)
+(add how much alternatives you want to receive (range 0-30 while 0 and 1 return 1 alternative))
+(add if you want to receive interim results)):
 ```
-GO_SPEECH_RECOGNITION_BOOL success = InitializeStream(language, sample_rate);
+GO_SPEECH_RECOGNITION_BOOL success = InitializeStream(language, sampleRate, model, maxAlternatives, interimResults);
 if (success != GO_SPEECH_RECOGNITION_TRUE) {
 	std::string log = GetLog();
 	std::cout << "Error:" << log << std::endl;
@@ -164,8 +168,24 @@ if (success != GO_SPEECH_RECOGNITION_TRUE) {
 ```
 Note: size has to be an Integer representing the sample count of the recording.
 
+
+
+While using the ReceiveTranscript function you need to provide a reference to a char* variable which will be overwritten with the current transcript.
+The transcript (when "maxAlternatives" is set > 1 ) will be transcoded by using ";" to split the alternatives, e.g.:
+
+- maxAlternatives: 3
+- Spoken: "word"
+- Result: "word;work;worked"
+
+The list is build with descending confidence rating ("word" is the best guess, "work" the second best...).
+
 ```
-std::string received = ReceiveTranscript();
+char* received; 
+GO_SPEECH_RECOGNITION_BOOL success = ReceiveTranscript(&received);
+if (success != GO_SPEECH_RECOGNITION_TRUE) {
+	std::string log = GetLog();
+	std::cout << "Error:" << log << std::endl;
+	// Or handle the error like you want to
 ```
 
 
